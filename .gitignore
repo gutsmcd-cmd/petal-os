@@ -1,0 +1,7 @@
+build/
+*.iso
+iso/boot/petal.elf
+src/font.h
+src/files.h
+files/*.bmp
+files/*.wav

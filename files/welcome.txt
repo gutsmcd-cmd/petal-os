@@ -1,0 +1,8 @@
+Welcome to Petal OS!
+
+This little computer system was built from scratch,
+just for Mat. No Linux, no Windows - every line is new.
+
+Open apps from the icons on the left, the Petal
+menu at the bottom, or the keys F1 to F10.
+Press Esc to close the window at the front.

@@ -13,6 +13,11 @@ for i in range(5):
 d.ellipse([68,43,92,67],fill=(222,206,170))
 d.line([80,77,80,118],fill=(110,130,105),width=4)
 im.save('files/flower.bmp')
+pg=Image.new('RGB',(200,140),(240,236,230));pd=ImageDraw.Draw(pg)
+for i in range(7):
+    pd.ellipse([10+i*26,30+(i%2)*30,50+i*26,70+(i%2)*30],fill=[(201,163,168),(157,174,152)][i%2])
+pd.rectangle([0,118,200,140],fill=(157,174,152))
+pg.save('files/petals.png',optimize=True)
 def wav(name,notes,rate=11025):
     data=bytearray()
     for f,dur in notes:

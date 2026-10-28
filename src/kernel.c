@@ -27,10 +27,12 @@ static void sleep_ms(u32 m){pit_poll();u32 t=ms_now;while(ms_now-t<m)pit_poll();
 /* ---------- RTC ---------- */
 static u8 cmos(u8 r){outb(0x70,r);return inb(0x71);}
 static int rtc_s,rtc_m,rtc_h,rtc_d,rtc_mo,rtc_y;
+static int clock_jst;
 static void rtc_read(void){while(cmos(0x0A)&0x80);u8 b=cmos(0x0B);int v[6]={cmos(0),cmos(2),cmos(4),cmos(7),cmos(8),cmos(9)};
  for(int i=0;i<6;i++){int x=v[i];if(i==2)x&=0x7F;if(!(b&4))x=(x&15)+(x>>4)*10;v[i]=x;}
  if(!(b&2)&&(cmos(4)&0x80))v[2]=(v[2]+12)%24;
- rtc_s=v[0];rtc_m=v[1];rtc_h=v[2];rtc_d=v[3];rtc_mo=v[4];rtc_y=2000+v[5];}
+ rtc_s=v[0];rtc_m=v[1];rtc_h=v[2];rtc_d=v[3];rtc_mo=v[4];rtc_y=2000+v[5];
+ if(clock_jst){rtc_h+=9;if(rtc_h>=24){rtc_h-=24;static const int ml[12]={31,28,31,30,31,30,31,31,30,31,30,31};int L=ml[rtc_mo-1]+(rtc_mo==2&&rtc_y%4==0);if(++rtc_d>L){rtc_d=1;if(++rtc_mo>12){rtc_mo=1;rtc_y++;}}}}}
 
 /* ---------- graphics ---------- */
 static u32 *fb; static u32 pitch,SW,SH;
@@ -86,9 +88,58 @@ static File*fs_write(const char*n,const u8*d,u32 s){File*f=fs_find(n);if(!f){if(
 
 /* ---------- BMP ---------- */
 static u32 rd32(const u8*p){return p[0]|p[1]<<8|p[2]<<16|(u32)p[3]<<24;}
-static int bmp_size(const u8*b,int*w,int*h){if(b[0]!='B'||b[1]!='M')return 0;*w=rd32(b+18);*h=(i32)rd32(b+22);if(*h<0)*h=-*h;return b[28]==24||b[28]==32;}
-static void bmp_draw(const u8*b,int x,int y,int sc){int w,h;if(!bmp_size(b,&w,&h))return;int bpp=b[28]/8;int top=(i32)rd32(b+22)<0;const u8*d=b+rd32(b+10);int st=(w*bpp+3)&~3;
+static int bmp_size0(const u8*b,int*w,int*h){if(b[0]!='B'||b[1]!='M')return 0;*w=rd32(b+18);*h=(i32)rd32(b+22);if(*h<0)*h=-*h;return b[28]==24||b[28]==32;}
+static void bmp_draw0(const u8*b,int x,int y,int sc){int w,h;if(!bmp_size0(b,&w,&h))return;int bpp=b[28]/8;int top=(i32)rd32(b+22)<0;const u8*d=b+rd32(b+10);int st=(w*bpp+3)&~3;
  for(int j=0;j<h;j++){const u8*r=d+(top?j:h-1-j)*st;for(int i=0;i<w;i++){u32 c=r[i*bpp+2]<<16|r[i*bpp+1]<<8|r[i*bpp];if(sc==1)px(x+i,y+j,c);else rect(x+i*sc,y+j*sc,sc,sc,c);}}}
+/* ---------- PNG (tiny inflate) ---------- */
+static const u8*zin;static u32 zpos,zbit;
+static int zgetbit(void){int b=(zin[zpos]>>zbit)&1;if(++zbit==8){zbit=0;zpos++;}return b;}
+static u32 zbits(int n){u32 v=0;for(int i=0;i<n;i++)v|=(u32)zgetbit()<<i;return v;}
+typedef struct{u16 cnt[16],sym[320];}Huff;
+static void hbuild(Huff*h,const u8*len,int n){int offs[16];for(int i=0;i<16;i++)h->cnt[i]=0;for(int i=0;i<n;i++)h->cnt[len[i]]++;h->cnt[0]=0;offs[1]=0;for(int i=1;i<15;i++)offs[i+1]=offs[i]+h->cnt[i];for(int i=0;i<n;i++)if(len[i])h->sym[offs[len[i]]++]=i;}
+static int hdecode(Huff*h){int code=0,first=0,idx=0;for(int l=1;l<16;l++){code|=zgetbit();int c=h->cnt[l];if(code-c<first)return h->sym[idx+(code-first)];idx+=c;first+=c;first<<=1;code<<=1;}return -1;}
+static const u16 lbase[29]={3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+static const u8 lext[29]={0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+static const u16 dbase[30]={1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+static const u8 dext[30]={0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+static Huff hl,hd,hc;
+static u32 zinflate(const u8*in,u8*out,u32 omax){zin=in;zpos=zbit=0;u32 o=0;int fin;u8 len[320];
+ do{fin=zbits(1);int t=zbits(2);
+  if(t==0){if(zbit){zbit=0;zpos++;}u32 n=zin[zpos]|zin[zpos+1]<<8;zpos+=4;while(n--&&o<omax)out[o++]=zin[zpos++];continue;}
+  if(t==1){for(int i=0;i<288;i++)len[i]=i<144?8:i<256?9:i<280?7:8;hbuild(&hl,len,288);for(int i=0;i<30;i++)len[i]=5;hbuild(&hd,len,30);}
+  else if(t==2){int nl=zbits(5)+257,nd=zbits(5)+1,nc=zbits(4)+4;static const u8 ord[19]={16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};u8 cl[19];for(int i=0;i<19;i++)cl[i]=0;for(int i=0;i<nc;i++)cl[ord[i]]=zbits(3);hbuild(&hc,cl,19);
+   int i=0;while(i<nl+nd){int sy=hdecode(&hc);if(sy<0)return 0;if(sy<16)len[i++]=sy;else{int r,v=0;if(sy==16){if(!i)return 0;v=len[i-1];r=3+zbits(2);}else if(sy==17)r=3+zbits(3);else r=11+zbits(7);while(r--&&i<320)len[i++]=v;}}
+   hbuild(&hl,len,nl);hbuild(&hd,len+nl,nd);}
+  else return 0;
+  for(;;){int sy=hdecode(&hl);if(sy<0||sy>285)return 0;if(sy<256){if(o<omax)out[o++]=sy;}else if(sy==256)break;else{sy-=257;u32 l=lbase[sy]+zbits(lext[sy]);int ds=hdecode(&hd);if(ds<0||ds>29)return 0;u32 d=dbase[ds]+zbits(dext[ds]);if(d>o)return 0;while(l--&&o<omax){out[o]=out[o-d];o++;}}}
+ }while(!fin);return o;}
+static u32 be32(const u8*p){return (u32)p[0]<<24|p[1]<<16|p[2]<<8|p[3];}
+#define PNGMAXW 640
+#define PNGMAXH 480
+static u32 png_px[PNGMAXW*PNGMAXH];static u8 png_raw[(PNGMAXW*4+1)*PNGMAXH],png_z[1<<20];static const u8*png_cur;static int png_w,png_h;
+static int png_load(const u8*b){if(png_cur==b)return png_w>0;png_cur=b;png_w=0;
+ static const u8 sig[8]={137,80,78,71,13,10,26,10};for(int i=0;i<8;i++)if(b[i]!=sig[i])return 0;
+ u32 p=8,zl=0;int w=0,h=0,ct=0,bd=0,il=0;static u8 pal[768];
+ for(int guard=0;guard<100000;guard++){u32 n=be32(b+p);const u8*t=b+p+4,*d=b+p+8;
+  if(t[0]=='I'&&t[1]=='H'){w=be32(d);h=be32(d+4);bd=d[8];ct=d[9];il=d[12];}
+  else if(t[0]=='P'&&t[1]=='L'&&t[2]=='T'){memcpy(pal,d,n<768?n:768);}
+  else if(t[0]=='I'&&t[1]=='D'&&t[2]=='A'){if(zl+n<=sizeof png_z){memcpy(png_z+zl,d,n);zl+=n;}}
+  else if(t[0]=='I'&&t[1]=='E'&&t[2]=='N')break;
+  p+=12+n;}
+ if(bd!=8||il||w<=0||h<=0||w>PNGMAXW||h>PNGMAXH)return 0;
+ int bpp=ct==2?3:ct==6?4:ct==3?1:ct==0?1:ct==4?2:0;if(!bpp)return 0;
+ u32 st=w*bpp,need=(st+1)*h;if(zinflate(png_z+2,png_raw,need)<need)return 0;
+ u8*prev=0;for(int y=0;y<h;y++){u8*c=png_raw+y*(st+1)+1;int f=c[-1];
+  for(u32 i=0;i<st;i++){int a=i>=(u32)bpp?c[i-bpp]:0,up=prev?prev[i]:0,ul=(prev&&i>=(u32)bpp)?prev[i-bpp]:0,v=c[i];
+   if(f==1)v+=a;else if(f==2)v+=up;else if(f==3)v+=(a+up)/2;else if(f==4){int pp=a+up-ul,pa=pp>a?pp-a:a-pp,pb=pp>up?pp-up:up-pp,pc=pp>ul?pp-ul:ul-pp;v+=(pa<=pb&&pa<=pc)?a:pb<=pc?up:ul;}
+   c[i]=v;}
+  for(int x=0;x<w;x++){u8*q=c+x*bpp;u32 R,G,B;if(ct==3){R=pal[q[0]*3];G=pal[q[0]*3+1];B=pal[q[0]*3+2];}else if(ct==0||ct==4){R=G=B=q[0];}else{R=q[0];G=q[1];B=q[2];}
+   if(ct==6||ct==4){u32 A=q[bpp-1];R=(R*A+0xFF*(255-A))/255;G=(G*A+0xFF*(255-A))/255;B=(B*A+0xFF*(255-A))/255;}
+   png_px[y*w+x]=R<<16|G<<8|B;}
+  prev=c;}
+ png_w=w;png_h=h;return 1;}
+static int bmp_size(const u8*b,int*w,int*h){if(b[0]==137&&b[1]=='P'){if(!png_load(b))return 0;*w=png_w;*h=png_h;return 1;}return bmp_size0(b,w,h);}
+static void bmp_draw(const u8*b,int x,int y,int sc){if(b[0]==137&&b[1]=='P'){if(!png_load(b))return;for(int j=0;j<png_h;j++)for(int i=0;i<png_w;i++){u32 c=png_px[j*png_w+i];if(sc==1)px(x+i,y+j,c);else rect(x+i*sc,y+j*sc,sc,sc,c);}return;}bmp_draw0(b,x,y,sc);}
 
 /* ---------- sound: PC speaker + Sound Blaster 16 ---------- */
 static void spk(u32 f){if(!f){outb(0x61,inb(0x61)&0xFC);return;}u32 d=1193180/f;outb(0x43,0xB6);outb(0x42,d);outb(0x42,d>>8);outb(0x61,inb(0x61)|3);}
@@ -146,10 +197,10 @@ static int hit(int x,int y,int w,int h){if(clicked&&clickx>=x&&clickx<x+w&&click
 typedef struct{const char*en,*ja,*ic;int w,h;u32 col;void(*draw)(int,int,int,int);void(*key)(int);void(*drag)(int,int,int);}App;
 enum{A_FILES,A_NOTES,A_CALC,A_CAL,A_MEDIA,A_PAINT,A_WEB,A_SET,A_SNAKE,A_TTT,NAPP};
 extern App apps[NAPP];
-typedef struct{int open,x,y;}Win;static Win wins[NAPP];static int zorder[NAPP],nz; /* zorder[nz-1] = front */
+typedef struct{int open,x,y,w,h;}Win;static Win wins[NAPP];static int zorder[NAPP],nz; /* zorder[nz-1] = front */
 static void focus(int a){int j=0;for(int i=0;i<nz;i++)if(zorder[i]!=a)zorder[j++]=zorder[i];zorder[j++]=a;nz=j;}
-static void open_app(int a){if(!wins[a].open){wins[a].open=1;static int cascade;wins[a].x=230+(cascade%6)*30+ (a==A_SNAKE?120:0);wins[a].y=40+(cascade%6)*26;cascade++;
-  if(wins[a].x+apps[a].w>(int)SW)wins[a].x=SW-apps[a].w-10;if(wins[a].y+apps[a].h+30>(int)SH-40)wins[a].y=10;}focus(a);}
+static void open_app(int a){if(!wins[a].open){wins[a].open=1;if(!wins[a].w){wins[a].w=apps[a].w;wins[a].h=apps[a].h;}static int cascade;wins[a].x=230+(cascade%6)*30+ (a==A_SNAKE?120:0);wins[a].y=40+(cascade%6)*26;cascade++;
+  if(wins[a].x+wins[a].w>(int)SW)wins[a].x=SW-wins[a].w-10;if(wins[a].y+wins[a].h+30>(int)SH-40)wins[a].y=10;}focus(a);}
 static void close_app(int a){wins[a].open=0;int j=0;for(int i=0;i<nz;i++)if(zorder[i]!=a)zorder[j++]=zorder[i];nz=j;if(a==A_MEDIA){wav_stop();tune_stop();}}
 static int front(void){return nz?zorder[nz-1]:-1;}
 #define TB 28  /* title bar */
@@ -253,14 +304,14 @@ static void open_file(const char*n);
 static void files_draw(int x,int y,int w,int h){textc(x,y+8,w,T("Everything saved on this computer","このパソコンに保存されているもの"),C_SOFT);
  rect(x+10,y+32,w-20,1,C_LINE);text(x+50,y+38,T("Name","名前"),C_SOFT);text(x+w-110,y+38,T("Size","サイズ"),C_SOFT);
  for(int i=0;i<nfiles&&y+60+i*28<y+h-10;i++){int ry=y+58+i*28;if(i==files_sel)rrect(x+10,ry-4,w-20,26,6,C_ROSE_L);
-  const char*nm=files[i].name;u32 ic=ends(nm,".txt")?C_SAGE:ends(nm,".html")?0xB9B39A:ends(nm,".bmp")?C_ROSE:0xA9A6C0;rrect(x+20,ry,18,18,4,ic);
+  const char*nm=files[i].name;u32 ic=ends(nm,".txt")?C_SAGE:ends(nm,".html")?0xB9B39A:(ends(nm,".bmp")||ends(nm,".png"))?C_ROSE:0xA9A6C0;rrect(x+20,ry,18,18,4,ic);
   text(x+50,ry+1,nm,C_TEXT);char s[16];u32 z=files[i].size;if(z<1024){itoa(z,s);scpy(s+slen(s)," B",4);}else{itoa(z/1024,s);scpy(s+slen(s)," KB",4);}text(x+w-110,ry+1,s,C_SOFT);
   if(hit(x+10,ry-4,w-20,26)){files_sel=i;open_file(nm);}}}
 static void files_key(int k){if(k==K_DOWN&&files_sel<nfiles-1)files_sel++;if(k==K_UP&&files_sel>0)files_sel--;if(k=='\n'&&files_sel>=0)open_file(files[files_sel].name);}
 
 /* ===== Media Player ===== */
 static int media_sel=0;static char media_cur[32]="sakura.wav";static int media_tune=-1;
-static int media_list(char out[][32]){int n=0;for(int i=0;i<nfiles&&n<12;i++)if(ends(files[i].name,".wav")||ends(files[i].name,".bmp"))scpy(out[n++],files[i].name,32);return n;}
+static int media_list(char out[][32]){int n=0;for(int i=0;i<nfiles&&n<12;i++)if(ends(files[i].name,".wav")||ends(files[i].name,".bmp")||ends(files[i].name,".png"))scpy(out[n++],files[i].name,32);return n;}
 static void media_draw(int x,int y,int w,int h){char L[12][32];int n=media_list(L);rect(x,y,190,h,C_SAGE_L);text(x+12,y+10,T("Library","ライブラリ"),C_SAGE_D);
  for(int i=0;i<n;i++){int ry=y+36+i*28;if(seq(L[i],media_cur)&&media_tune<0)rrect(x+6,ry-4,178,26,6,C_WIN);drawch(x+14,ry,ends(L[i],".wav")?0x25B6:0x25A0,C_ROSE_D,1);text(x+36,ry,L[i],C_TEXT);if(hit(x+6,ry-4,178,26)){scpy(media_cur,L[i],32);media_tune=-1;}}
  int ty=y+46+n*28;text(x+12,ty,T("Tunes (speaker)","メロディー"),C_SAGE_D);
@@ -273,7 +324,7 @@ static void media_draw(int x,int y,int w,int h){char L[12][32];int n=media_list(
   if(tune){rect(px0+30,y+190,pw-60,6,C_LINE);int tot=0,i2=0;while(tune==tune_sakura?tune_sakura[i2*2+1]:tune_happy[i2*2+1])i2++;tot=i2;rect(px0+30,y+190,(pw-60)*tune_i/(tot?tot:1),6,C_ROSE);}
   return;}
  File*f=fs_find(media_cur);if(!f)return;
- if(ends(media_cur,".bmp")){int iw,ih;if(bmp_size(f->data,&iw,&ih)){int sc=1;while((iw*(sc+1))<=pw-20&&(ih*(sc+1))<=h-50)sc++;bmp_draw(f->data,px0+(pw-iw*sc)/2,y+10,sc);char s[32];itoa(iw,s);scpy(s+slen(s)," x ",4);itoa(ih,s+slen(s));textc(px0,y+h-30,pw,s,C_SOFT);}return;}
+ if(ends(media_cur,".bmp")||ends(media_cur,".png")){int iw,ih;if(bmp_size(f->data,&iw,&ih)){int sc=1;while((iw*(sc+1))<=pw-20&&(ih*(sc+1))<=h-50)sc++;bmp_draw(f->data,px0+(pw-iw*sc)/2,y+10,sc);char s[32];itoa(iw,s);scpy(s+slen(s)," x ",4);itoa(ih,s+slen(s));textc(px0,y+h-30,pw,s,C_SOFT);}return;}
  rrect(px0+pw/2-60,y+30,120,120,20,C_ROSE_L);drawch(px0+pw/2-24,y+66,0x25B6,C_ROSE_D,3);textc(px0,y+168,pw,media_cur,C_TEXT);
  if(button(px0+pw/2-110,y+200,100,34,T("Play","再生"),1)){if(!wav_play(f->data,f->size))tune_play(tune_sakura);}
  if(button(px0+pw/2+10,y+200,100,34,T("Stop","停止"),0)){wav_stop();tune_stop();}
@@ -305,7 +356,9 @@ static void set_draw(int x,int y,int w,int h){(void)h;text(x+20,y+16,T("Language
  text(x+20,y+92,T("Desktop colour","デスクトップの色"),C_SAGE_D);
  const char*wn[3]={T("Sage mist","セージ"),T("Dusty rose","ローズ"),T("Linen","リネン")};
  for(int i=0;i<3;i++){int bx=x+20+i*130;rrect(bx,y+116,120,50,8,wall_cols[i]);frame(bx,y+116,120,50,i==wall?C_ROSE_D:C_LINE);textc(bx,y+132,120,wn[i],C_TEXT);if(hit(bx,y+116,120,50))wall=i;}
- rect(x+20,y+186,w-40,1,C_LINE);text(x+20,y+200,T("About","この機能について"),C_SAGE_D);
+ text(x+20,y+186,T("Clock","時計"),C_SAGE_D);
+ if(button(x+20,y+210,200,32,T("Computer clock","パソコンの時計"),!clock_jst))clock_jst=0;if(button(x+230,y+210,200,32,T("Japan time (UTC+9)","日本時間 (UTC+9)"),clock_jst))clock_jst=1;
+ y+=70;rect(x+20,y+186,w-40,1,C_LINE);text(x+20,y+200,T("About","この機能について"),C_SAGE_D);
  text(x+20,y+224,T("Petal OS 1.0 - built from scratch for Mat","はなびらOS 1.0 - マットさんのために一から作成"),C_TEXT);
  char m[48];itoa(nfiles,m);scpy(m+slen(m),T(" files in memory"," 個のファイル"),40);text(x+20,y+246,m,C_SOFT);
  text(x+20,y+268,sb_ok?T("Sound: Sound Blaster 16 + speaker","音: Sound Blaster 16 + スピーカー"):T("Sound: PC speaker","音: PCスピーカー"),C_SOFT);
@@ -353,24 +406,36 @@ App apps[NAPP]={
  {"Media Player","メディア",">",620,400,0x9FB8C2,media_draw,media_key,0},
  {"Paint","お絵かき","P",540,386,0xD9B99B,paint_draw,0,paint_drag},
  {"Browser","ブラウザ","W",600,480,0x8FA9A0,web_draw,web_key,0},
- {"Settings","設定","S",480,340,0xA8A49E,set_draw,set_key,0},
+ {"Settings","設定","S",480,410,0xA8A49E,set_draw,set_key,0},
  {"Snake","ヘビ","~",496,380,0x9DAE98,snake_draw,snake_key,0},
  {"Noughts & Crosses","まるばつ","X",360,390,0xC9A3A8,ttt_draw,ttt_key,0},
 };
 static void open_file(const char*n){if(ends(n,".txt")){notes_load(n);open_app(A_NOTES);}else if(ends(n,".html")){web_go(n);open_app(A_WEB);}else{scpy(media_cur,n,32);media_tune=-1;open_app(A_MEDIA);}}
 
 /* ---------- desktop ---------- */
-static int menu_open,drag_win=-1,drag_dx,drag_dy,app_drag=-1;
+static int rs_win=-1,rs_x0,rs_y0,rs_w0,rs_h0;static int menu_open,drag_win=-1,drag_dx,drag_dy,app_drag=-1;
 static int pend_click,pend_x,pend_y; /* click routed into next draw */
 static int pend_app=-1;
 static void icon_pos(int i,int*x,int*y){*x=10+(i/6)*100;*y=14+(i%6)*100;}
-static void draw_icon(int x,int y,int a,int big){int s=big?48:20;rrect(x,y,s,s,big?12:5,apps[a].col);const char*ic=apps[a].ic;if(big)textc(x,y+16,s,ic,0xFFFFFF);else textc(x,y+2,s,ic,0xFFFFFF);}
-static void draw_window(int a){Win*w=&wins[a];int W=apps[a].w,H=apps[a].h,act=front()==a;clip_all();
+static const u16 icon_art[NAPP][16]={{0x0000,0x0000,0x3E00,0x7F00,0x7FFE,0x7FFE,0x7FFE,0x7FFE,0x7FFE,0x7FFE,0x7FFE,0x7FFE,0x0000,0x0000,0x0000,0x0000},
+{0x0000,0x1FF8,0x1008,0x1008,0x17E8,0x1008,0x17E8,0x1008,0x17E8,0x1008,0x1788,0x1008,0x1FF8,0x0000,0x0000,0x0000},
+{0x0000,0x1FF8,0x1008,0x17E8,0x17E8,0x1008,0x16D8,0x16D8,0x1008,0x16D8,0x16D8,0x1008,0x1FF8,0x0000,0x0000,0x0000},
+{0x0000,0x0840,0x3FFC,0x3FFC,0x3FFC,0x2004,0x2DB4,0x2004,0x2DB4,0x2004,0x2D84,0x2004,0x3FFC,0x0000,0x0000,0x0000},
+{0x0000,0x0000,0x0C00,0x0F00,0x0FC0,0x0FF0,0x0FFC,0x0FFE,0x0FFC,0x0FF0,0x0FC0,0x0F00,0x0C00,0x0000,0x0000,0x0000},
+{0x0000,0x000E,0x001E,0x003C,0x0078,0x00F0,0x01E0,0x03C0,0x0B80,0x1E00,0x3E00,0x3C00,0x7800,0x6000,0x0000,0x0000},
+{0x0000,0x07E0,0x1998,0x2244,0x4242,0x7FFE,0x4422,0x4422,0x7FFE,0x4242,0x2244,0x1998,0x07E0,0x0000,0x0000,0x0000},
+{0x0000,0x0180,0x1998,0x1FF8,0x0E70,0x1C38,0x781E,0x781E,0x1C38,0x0E70,0x1FF8,0x1998,0x0180,0x0000,0x0000,0x0000},
+{0x0000,0x0000,0x1FC0,0x3FE0,0x3060,0x3000,0x3FC0,0x1FE0,0x0030,0x3030,0x3FF0,0x1FEC,0x000C,0x0000,0x0000,0x0000},
+{0x0000,0x0C60,0x4D66,0x2CB6,0x4D66,0xFFFC,0x0C60,0x0DB0,0x0D30,0x0DB0,0xFFFC,0x0C60,0x6D64,0x6CE8,0x0C60,0x0000}};
+static void draw_icon(int x,int y,int a,int big){int s=big?48:20;rrect(x,y,s,s,big?12:5,apps[a].col);int cs=big?2:1,o=big?8:2;
+ for(int j=0;j<16;j++){u16 r=icon_art[a][j];for(int i=0;i<16;i++)if(r&(0x8000>>i))rect(x+o+i*cs,y+o+j*cs+(big?1:0),cs,cs,0xFFFFFF);}}
+static void draw_window(int a){Win*w=&wins[a];int W=w->w,H=w->h,act=front()==a;clip_all();
  rrect(w->x+3,w->y+4,W,H+TB,10,mix(wall_cols[wall],0x000000,28));rrect(w->x,w->y,W,H+TB,10,act?C_ROSE:0xD6D3CE);rect(w->x+1,w->y+TB,W-2,H-8,C_WIN);rrect(w->x+1,w->y+TB+H-20,W-2,19,9,C_WIN);
  draw_icon(w->x+8,w->y+4,a,0);text(w->x+36,w->y+6,T(apps[a].en,apps[a].ja),act?0xFFFFFF:C_TEXT);
  rrect(w->x+W-26,w->y+5,18,18,9,act?C_ROSE_D:0xC4C1BC);drawch(w->x+W-21,w->y+6,0xD7,0xFFFFFF,1);
  clicked=0;if(pend_click&&pend_app==a){clicked=1;clickx=pend_x;clicky=pend_y;pend_click=0;}
- clip(w->x+1,w->y+TB,W-2,H-2);apps[a].draw(w->x+1,w->y+TB,W-2,H-2);clip_all();}
+ clip(w->x+1,w->y+TB,W-2,H-2);apps[a].draw(w->x+1,w->y+TB,W-2,H-2);clip_all();
+ for(int i=0;i<3;i++)for(int j=0;j<=i;j++)rect(w->x+W-6-j*4,w->y+TB+H-6-(i-j)*4,2,2,0xB8B4AE);}
 static void draw_cursor(void){static const char*c[]={"X","XX","X.X","X..X","X...X","X....X","X.....X","X......X","X.......X","X........X","X.....XXXX","X..X..X","X.X X..X","XX  X..X","    X..X","     XX"};
  for(int j=0;j<16;j++)for(int i=0;c[j][i];i++){if(c[j][i]=='X')px(mx+i,my+j,0x3E403C);else if(c[j][i]=='.')px(mx+i,my+j,0xFFFFFF);}}
 static void render(void){clip_all();rect(0,0,SW,SH,wall_cols[wall]);
@@ -392,13 +457,15 @@ static void render(void){clip_all();rect(0,0,SW,SH,wall_cols[wall]);
  draw_cursor();
  for(u32 j=0;j<SH;j++)memcpy((u8*)fb+j*pitch,back+j*SW,SW*4);}
 static void on_mouse(void){int press=mbtn&&!mprev,rel=!mbtn&&mprev;mprev=mbtn;int ty=SH-40;
+ if(rs_win>=0){if(mbtn){Win*w=&wins[rs_win];w->w=rs_w0+mx-rs_x0;w->h=rs_h0+my-rs_y0;if(w->w<260)w->w=260;if(w->h<160)w->h=160;if(w->w>(int)SW-w->x)w->w=SW-w->x;if(w->h>(int)SH-40-TB-w->y)w->h=SH-40-TB-w->y;}else rs_win=-1;return;}
  if(drag_win>=0){if(mbtn){wins[drag_win].x=mx-drag_dx;wins[drag_win].y=my-drag_dy;if(wins[drag_win].y<0)wins[drag_win].y=0;}else drag_win=-1;return;}
  if(app_drag>=0){if(apps[app_drag].drag)apps[app_drag].drag(mbtn?1:2,mx,my);if(!mbtn)app_drag=-1;return;}
  (void)rel;if(!press)return;
  if(menu_open){int mh=NAPP*32+16,my0=ty-mh-4;menu_open=0;if(mx>=6&&mx<246&&my>=my0+8&&my<my0+8+NAPP*32){open_app((my-my0-8)/32);return;}if(my>=ty&&mx<106)return;}
  if(my>=ty){if(mx<106){menu_open=1;return;}int bx=116;for(int i=0;i<NAPP;i++)if(wins[i].open){if(mx>=bx&&mx<bx+130){if(front()==i)close_app(i),open_app(i);else focus(i);return;}bx+=136;}return;}
- for(int z=nz-1;z>=0;z--){int a=zorder[z];Win*w=&wins[a];int W=apps[a].w,H=apps[a].h;if(mx>=w->x&&mx<w->x+W&&my>=w->y&&my<w->y+H+TB){focus(a);
+ for(int z=nz-1;z>=0;z--){int a=zorder[z];Win*w=&wins[a];int W=w->w,H=w->h;if(mx>=w->x&&mx<w->x+W&&my>=w->y&&my<w->y+H+TB){focus(a);
    if(my<w->y+TB){if(mx>=w->x+W-28){close_app(a);return;}drag_win=a;drag_dx=mx-w->x;drag_dy=my-w->y;return;}
+   if(mx>=w->x+W-16&&my>=w->y+TB+H-16){rs_win=a;rs_x0=mx;rs_y0=my;rs_w0=W;rs_h0=H;return;}
    pend_click=1;pend_x=mx;pend_y=my;pend_app=a;if(apps[a].drag){app_drag=a;apps[a].drag(0,mx,my);}return;}}
  for(int a=0;a<NAPP;a++){int x,y;icon_pos(a,&x,&y);if(mx>=x&&mx<x+80&&my>=y&&my<y+90){open_app(a);return;}}}
 static void on_key(int k){if(k>=K_F1&&k<K_F1+NAPP){open_app(k-K_F1);return;}

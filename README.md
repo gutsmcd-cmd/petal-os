@@ -5,7 +5,7 @@ A small hobby operating system built **from scratch** for Mat. It has no Linux k
 The colours are muted on purpose: sage, dusty rose and off-white.
 
 ## What's inside
-- A graphical desktop with windows you can drag, a taskbar, a clock and the **Petal** start menu
+- A graphical desktop with picture icons, windows you can drag and resize (pull the bottom-right corner), a taskbar, a clock and the **Petal** start menu
 - PS/2 mouse and keyboard (USB mice and keyboards also work on PCs that have "USB legacy support")
 - A RAM file system with built-in files. Anything you save is lost when you turn the computer off
 - Apps:
@@ -13,10 +13,10 @@ The colours are muted on purpose: sage, dusty rose and off-white.
   - Notes
   - Calculator
   - Calendar with a clock
-  - Media Player: plays WAV files through a Sound Blaster 16, tunes through the PC speaker, and shows BMP pictures
+  - Media Player: plays WAV files through a Sound Blaster 16, tunes through the PC speaker, and shows BMP and PNG pictures (8-bit PNG up to 640 x 480)
   - Paint, which saves to `painting.bmp`
   - Browser: an offline HTML viewer for the built-in pages
-  - Settings: English/日本語, desktop colour
+  - Settings: English/日本語, desktop colour, clock (computer clock or Japan time, UTC+9)
   - Two games: Snake and Noughts & Crosses
 - English and Japanese interface (uses a GNU Unifont subset)
 
@@ -44,7 +44,7 @@ make run
 ## Not done yet (future work)
 - Online browsing. This needs a network card driver, TCP/IP and HTTPS
 - Drivers made for Mat's own PC: USB, the real sound chip, NVMe/SATA disks so files can be saved permanently, Wi-Fi
-- UEFI boot, Japanese typing, more file types (MP3, PNG), resizable windows
+- UEFI boot, Japanese typing, more file types (MP3, JPEG)
 
 ## Credits
 - GNU Unifont glyphs (SIL OFL 1.1 / GPL with font exception) for the text
